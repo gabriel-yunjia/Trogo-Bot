@@ -12,8 +12,6 @@
   "dependencies": {
     "discord.js": "^14.22.1",
     "dotenv": "^17.2.2",
-    "luxon": "^3.5.0"
+    "luxon": "^3.7.2"
   }
-
-  
 }
