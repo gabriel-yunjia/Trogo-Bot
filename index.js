@@ -224,4 +224,13 @@ async function announceTodayForGuild(guildId) {
 }
 function runBirthdayLoop() {
   // announce on boot (in case mid-day restarts), then every minute
-  for (const [gid] of client.guilds.cache) announceTodayForGu
+  for (const [gid] of client.guilds.cache) announceTodayForGuild(gid);
+  setInterval(() => { for (const [gid] of client.guilds.cache) announceTodayForGuild(gid); }, 60 * 1000);
+}
+
+/* ========= HARDENING (optional but nice) ========= */
+process.on('unhandledRejection', (e) => console.error('UnhandledRejection:', e));
+process.on('uncaughtException', (e) => console.error('UncaughtException:', e));
+client.on('error', (e) => console.error('Client error:', e));
+
+client.login(process.env.BOT_TOKEN);
