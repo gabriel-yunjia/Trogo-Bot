@@ -61,8 +61,10 @@ function guildStore(gid) {
   return store.guilds[gid];
 }
 function isValidDate(month, day) {
-  return DateTime.fromObject({ year: 2024, month, day, zone: TZ }).isValid; // allow Feb 29
+  // Put zone in the *second* argument (options)
+  return DateTime.fromObject({ year: 2025, month, day }, { zone: TZ }).isValid;
 }
+
 function monthDayKey(month, day) {
   return String(month).padStart(2, '0') + '-' + String(day).padStart(2, '0');
 }
