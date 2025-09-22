@@ -1,11 +1,27 @@
 require('dotenv').config();
 const {
-  Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ChannelType
+  Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ChannelType, PermissionsBitField
 } = require('discord.js');
 const { DateTime, Duration } = require('luxon');
 const fs = require('fs');
 const path = require('path');
 
+/* ========= PERSISTENT STORAGE (Volume-friendly) ========= */
+const STORE_PATH = process.env.BIRTHDAY_STORE || path.join(__dirname, 'birthdays.json');
+fs.mkdirSync(path.dirname(STORE_PATH), { recursive: true });
+function loadStore() {
+  try { return JSON.parse(fs.readFileSync(STORE_PATH, 'utf8')); }
+  catch { return { guilds: {} }; }
+}
+function saveStore(data) {
+  const tmp = STORE_PATH + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, STORE_PATH);
+}
+let store = loadStore();
+console.log('Birthday store path:', STORE_PATH);
+
+/* ========= CONFIG ========= */
 const TZ = process.env.TIMEZONE || 'America/Los_Angeles';
 const GUILD_ID = process.env.GUILD_ID;
 const FALLBACK_CHANNEL = process.env.BIRTHDAY_CHANNEL_ID || null;
@@ -46,30 +62,20 @@ function human(ms) {
   return parts.join(' ');
 }
 
-/* ========= BIRTHDAYS (JSON storage) ========= */
-const STORE_PATH = path.join(__dirname, 'birthdays.json');
-function loadStore() {
-  try { return JSON.parse(fs.readFileSync(STORE_PATH, 'utf8')); }
-  catch { return { guilds: {} }; }
-}
-function saveStore(data) {
-  fs.writeFileSync(STORE_PATH, JSON.stringify(data, null, 2));
-}
-let store = loadStore();
+/* ========= BIRTHDAYS ========= */
 function guildStore(gid) {
   if (!store.guilds[gid]) store.guilds[gid] = { channelId: FALLBACK_CHANNEL, entries: [], announcedOn: null };
   return store.guilds[gid];
 }
 function isValidDate(month, day) {
-  // Put zone in the *second* argument (options)
-  return DateTime.fromObject({ year: 2025, month, day }, { zone: TZ }).isValid;
+  // Use a leap year so 2/29 is allowed. Put zone in the second arg.
+  return DateTime.fromObject({ year: 2024, month, day }, { zone: TZ }).isValid;
 }
-
 function monthDayKey(month, day) {
   return String(month).padStart(2, '0') + '-' + String(day).padStart(2, '0');
 }
 
-/* ========= Command registration ========= */
+/* ========= COMMAND REGISTRATION (guild = instant) ========= */
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 
@@ -97,10 +103,12 @@ client.once('ready', async () => {
   runBirthdayLoop();
 });
 
-/* ========= Command handlers ========= */
+/* ========= COMMAND HANDLERS ========= */
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   const now = DateTime.now().setZone(TZ);
+
+  // Ensure guild store exists
   const g = guildStore(interaction.guildId);
 
   if (interaction.commandName === 'bongotime') {
@@ -108,7 +116,6 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   if (interaction.commandName === 'nextclass') {
-    // in class?
     for (const entry of SCHEDULE) {
       const { start, end } = rangeFor(now, entry);
       if (now >= start && now <= end) {
@@ -120,7 +127,6 @@ client.on('interactionCreate', async (interaction) => {
         );
       }
     }
-    // next one
     const nexts = SCHEDULE.map(e => ({ e, at: nextStart(now, e) })).sort((a,b)=>a.at-b.at);
     const { e, at } = nexts[0];
     return interaction.reply(
@@ -134,17 +140,36 @@ client.on('interactionCreate', async (interaction) => {
     const name = interaction.options.getString('name', true).trim();
     const month = interaction.options.getInteger('month', true);
     const day = interaction.options.getInteger('day', true);
+
     if (!isValidDate(month, day)) {
       return interaction.reply({ content: '❌ That month/day combo isn’t valid. Try again.', ephemeral: true });
     }
+
     g.entries.push({ name, month, day, addedBy: interaction.user.id, md: monthDayKey(month, day) });
     saveStore(store);
+
+    // If the birthday is TODAY, announce immediately
+    const todayMD = now.toFormat('MM-dd');
+    if (monthDayKey(month, day) === todayMD) {
+      const channelId = g.channelId || FALLBACK_CHANNEL;
+      if (channelId) {
+        try {
+          const channel = await client.channels.fetch(channelId);
+          await channel.send(`🎉🎂 Happy Birthday **${name}** (${month}/${day})!`);
+          g.announcedOn = now.toISODate();
+          saveStore(store);
+        } catch (e) {
+          console.error('Immediate birthday send failed:', e);
+        }
+      }
+    }
+
     return interaction.reply({ content: `🎉 Saved **${name}** → ${month}/${day}. I’ll announce it on their birthday!`, ephemeral: true });
   }
 
   if (interaction.commandName === 'setbirthdaychannel') {
     const member = await interaction.guild.members.fetch(interaction.user.id);
-    if (!member.permissions.has('ManageGuild')) {
+    if (!member.permissions.has(PermissionsBitField.Flags.ManageGuild)) {
       return interaction.reply({ content: '❌ You need **Manage Server** to set the birthday channel.', ephemeral: true });
     }
     const channel = interaction.options.getChannel('channel', true);
@@ -164,33 +189,39 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-/* ========= Daily announcer ========= */
+/* ========= DAILY ANNOUNCER ========= */
 async function announceTodayForGuild(guildId) {
   const g = guildStore(guildId);
   const today = DateTime.now().setZone(TZ);
-  if (g.announcedOn === today.toISODate()) return; // already done today
 
-  const todayMD = today.toFormat('MM-dd');
-  const todays = g.entries.filter(e => e.md === todayMD);
-  if (todays.length === 0) {
-    g.announcedOn = today.toISODate(); saveStore(store); return;
+  // If we've already announced today, skip
+  if (g.announcedOn === today.toISODate()) return;
+
+  let todays = g.entries.filter(e => e.md === today.toFormat('MM-dd'));
+
+  // Optional: celebrate Feb 29 people on Feb 28 in non-leap years
+  if (!today.isInLeapYear && today.month === 2 && today.day === 28) {
+    todays = todays.concat(g.entries.filter(e => e.md === '02-29'));
   }
+
+  if (todays.length === 0) {
+    // Do NOT mark announcedOn; allows same-day additions to be picked up later
+    return;
+  }
+
   const channelId = g.channelId || FALLBACK_CHANNEL;
-  if (!channelId) { g.announcedOn = today.toISODate(); saveStore(store); return; }
+  if (!channelId) return;
 
   try {
     const channel = await client.channels.fetch(channelId);
     const names = todays.map(e => `**${e.name}** (${e.month}/${e.day})`).join(', ');
     await channel.send(`🎉🎂 Happy Birthday ${names}! Have an amazing day!`);
-    g.announcedOn = today.toISODate(); saveStore(store);
+    g.announcedOn = today.toISODate();
+    saveStore(store);
   } catch (err) {
     console.error('[birthdays] Failed to send announcement:', err);
   }
 }
 function runBirthdayLoop() {
   // announce on boot (in case mid-day restarts), then every minute
-  for (const [gid] of client.guilds.cache) announceTodayForGuild(gid);
-  setInterval(() => { for (const [gid] of client.guilds.cache) announceTodayForGuild(gid); }, 60 * 1000);
-}
-
-client.login(process.env.BOT_TOKEN);
+  for (const [gid] of client.guilds.cache) announceTodayForGu
